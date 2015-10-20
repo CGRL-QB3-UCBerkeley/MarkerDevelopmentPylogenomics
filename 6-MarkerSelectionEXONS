@@ -1,0 +1,1117 @@
+#!/usr/bin/perl
+
+use List::Util 'shuffle';
+use warnings;
+use strict;
+use Getopt::Std;
+use File::Basename;
+#use Bio::DB::Fasta;
+
+
+
+&main;
+exit;
+
+sub main {
+        &usage if (@ARGV<1);
+        my $command = shift(@ARGV);
+        my %fun = (exons=>\&exons, snp=>\&snp, seq=>\&seq);
+        die("Unknown command \"$command\"\n") if (!defined($fun{$command}));
+        &{$fun{$command}};
+      }
+
+sub usage {
+  die(qq/
+Usage: 6-MarkerSelectionEXONS <command> [<arguments>]\n
+
+Command: 
+
+exons:          find exonic orthologous markers across transcriptomes
+
+seq:            generate input files for probe design
+
+
+Note: always run step 1 -exons-, and then run step 2 -seq-.
+
+\n/);
+}
+
+
+
+#################################################################################################
+
+sub snp {
+  die(qq/
+6-MarkerSelectionEXONS snp [options] 
+
+options:
+
+-v FILE    folder with vcf files (use one transcriptome as a reference for mapping. eg. ABC.vcf, DEF.vcf, GHI.vcf ... the names of vcf files correspond to the libraries)
+-f FILE    a list of makers that will be used as probe design (e.g. random_popgen_markers.txt or a txt file with the same format)
+-d FILE    exonic sequence file of the reference transcriptome (ABC_exon.fa.nr)
+-n INT     number of individuals in the sample
+
+Note: indels will not be called
+
+\n\n/) unless (@ARGV);
+  
+  my %opts = (v=>undef, f=>undef,d=>undef,n=>undef);
+  getopts('v:f:d:n:', \%opts);
+  
+  my $dir = dirname ($opts{f}) . "/";
+  
+  my $file = $opts{f};
+  
+  my $vcf_dir;
+  
+  if ($opts{v} =~ m/\/$/ ){
+    $vcf_dir = $opts{v}; 
+  }
+  else {
+    $vcf_dir = $opts{v} . "/";
+  }
+
+  
+  my @vcf = <$vcf_dir*vcf>;
+  my $ref_exon = $opts{d};
+  my $sample = $opts{n};
+  my %ref;
+  
+  open (IN, "<", $ref_exon);
+  while (<IN>) {
+    chomp (my @line = split /\s+/, $_);
+    if ($line[0] =~ m/^>(\S+)/) {
+      my $species =$1;
+      my $contig = $line[1];
+      my $id =$1 if ($contig =~ m/(\S+\d+)_(\d+)_(\d+)/);
+      my $start = $2;
+      my $end =$3;  
+      my $prot = $line[2];
+      chomp (my $seq = <IN>);
+      $ref{$prot} = {'species' => $species, 'contig' => $id, 'start'=>$start, 'end'=>$end, 'seq'=>$seq, 'contig_all' =>$contig };  
+    }
+  }
+  close IN;
+  
+  open (F, "<", $file);
+  while (<F>) { 
+    chomp ($_);
+    if ($_ =~ m/^(ENS\S+)/) {
+      my $d = $1;
+      unless ($ref{$d}) {
+	delete ($ref{$d});	
+      }	
+    }
+  }
+  close F; 
+  
+  my $out = $vcf_dir . "genotype_call.txt";
+  parseVCF (\@vcf, $out, $sample, \%ref);
+  
+  
+  sub parseVCF {
+    my ($variant, $out, $sample, $ref) = @_;
+    my %vcf; my %position; my %ref = %{$ref};
+    my @variant = @{$variant};
+    my @variant1 = @variant;
+    
+    foreach (@variant) { 
+      my $lib =$1 if basename($_) =~ m/(\S+).vcf/;
+      open (VCF, "<", $_);  
+      while (<VCF>) {
+	unless ($_ =~ /^\#/ || $_ =~ /^$/) {
+	  
+	  chomp (my @line = split /\s+/, $_);
+	  my $name = $line[0];
+	  my $pos = $line[1];
+	  my $ref_base = $line[3];
+	  my $alt_base = $line[4];
+	  my $qual = $line[5];
+	  my $cov = $1 if ($line[7] =~ m/DP=(\d+);/);
+	  
+	  my $call =  $line[9];
+	  chomp (my @item = split /:/, $call);
+	  my $gen = $item[0]; 
+	  my $geno;
+	  if ($ref_base =~ m/[A|T|C|G]/) {
+	    if ($alt_base =~ m/[A|T|C|G]/) {
+	      if ($ref_base ne $alt_base) {
+		$position{$name}{$pos}++;
+		if ($cov >= 10){
+		  if ($gen eq "0/1" || $gen eq "1/0" || $gen eq "0|1" || $gen eq "1|0") {
+		    my $geno = $ref_base."|". $alt_base;
+	             $vcf{$lib}{$name}{$pos} = {'g'=> $geno};
+		  }
+		  elsif ($gen eq "1/1" || $gen eq "1|1" ) {
+		    my $geno = $alt_base."|". $alt_base;
+		    $vcf{$lib}{$name}{$pos} = {'g'=> $geno};
+		  } 
+		  else {
+		    $vcf{$lib}{$name}{$pos} = {'g'=> 'WTF?'};
+		    print $lib ,"\t", $name, "\t",  $pos, "\t", $vcf{$lib}{$name}{$pos}{'g'}, "\n";
+		  }   
+		}
+		else {
+		  $vcf{$lib}{$name}{$pos} = {'g'=> 'low_cov'};
+		}
+		
+	      }
+	    }      
+	  }     	
+	} #unless ($_ =~ /^\#/)
+      } #while (<VCF>)
+      close VCF;
+    } # foreach (@variant)
+    
+    
+    
+    open (OUT, ">", $out);
+    print OUT "Exon_ID", "\t",  "Contig_ID", "\t", "position", "\t";
+    my $z =0;	
+    foreach (@variant1) {
+      my $l = $1 if basename($_) =~ m/(\S+).vcf/;
+      if ($z < $sample-1) {
+	print OUT "geno_", $l, "\t"; 	
+      }
+      elsif($z = $sample-1) {
+	print OUT "geno_", $l, "\n"; 
+      }
+      $z++;	
+    }	
+    
+    foreach my $c (sort {$a cmp $b} keys %position) {
+      
+      foreach my $p (sort {$a <=> $b} keys %{$position{$c}}) {
+	
+	foreach my $c1 (sort {$a cmp $b} keys %ref) {
+	  
+	  if ($ref{$c1}{'contig'} eq $c) {
+	    if ($p >= $ref{$c1}{'start'} && $p <= $ref{$c1}{'end'}) {
+	      print OUT $c1, "\t", $ref{$c1}{'contig_all'}, "\t", $p, "\t";
+	      my $d = 1;
+	      foreach my $l (sort {$a cmp $b} keys %vcf) {   
+		if ($vcf{$l}{$c}{$p}) {
+		  if ($d < $sample) {
+		    print OUT $vcf{$l}{$c}{$p}{'g'}, "\t" ;
+		  } 
+		  elsif ($d = $sample) {
+		    print OUT $vcf{$l}{$c}{$p}{'g'}, "\n" ;
+		  }
+		}
+		else {
+		  if ($d < $sample) {
+		    print OUT "NA", "\t" ;
+		  } 
+		  elsif ($d = $sample) {
+		    print OUT "NA", "\n" ;
+		  }
+		}
+		
+		$d++;
+		
+	      }		 
+	    } 
+	  }
+	}
+      }   
+    }	 
+    close OUT;	
+  }          
+}
+
+
+sub seq {
+  
+  die(qq/
+6-MarkerSelectionEXONS seq [options] 
+
+options:
+
+-f FILE    a list of makers that you would like to use for probe design (e.g. random_popgen_markers.txt or a txt file with the same format)
+-d CHR     deritory of exonic sequences (strict naming: ABC_exon.fa.nr, DEF_exon.fa.nr, GHI_exon.fa.nr......) 
+\n\n/) unless (@ARGV);
+  
+  my %opts = (d=>undef, f=>undef);
+  getopts('d:f:', \%opts);
+  
+  my $dir;
+  if ($opts{d} =~ m/\/$/ ){
+    $dir = $opts{d}; 
+  }
+  else {
+    $dir = $opts{d} . "/";
+  }
+  
+  my $outDir = $dir . 'Probe_Design/';
+  mkdir $outDir unless -e $outDir;
+  
+  my @seq = <$dir*_exon.fa.nr>;
+  
+  foreach (@seq) {
+    my $id = $1 if basename ($_) =~ m/(\S+)_exon.fa.nr/;
+    my $coor = $outDir . $id . '_target_input_coordinats.tsv';
+    my $seqFile = $outDir . $id . '_exonic_targets.txt'; 
+    probe ($opts{f}, $_, $coor, $seqFile);
+    
+  }
+  
+  sub probe {
+    my ($id, $file, $coordinates,$target) = @_;
+    open (IN, "<", $file);
+    my %seq;
+    while (<IN>) {
+      chomp (my @line = split /\s+/, $_);
+      if ($line[0] =~ m/^>(\S+)/) {
+	my $species = $1;
+	my $contig = $line[1];
+	my $prot = $line[2];
+	chomp (my $seq = <IN>);
+	$seq{$prot} = {'species' => $species, 'contig' =>$contig, 'seq'=>$seq};  
+      }
+    }
+    close IN;
+    
+    open (IN1, "<", $id);
+    open (TAR, ">", $target);
+    open (COR, ">", $coordinates);
+    my $a = 1;
+    while (<IN1>) {
+      chomp ($_);
+      if ($_ =~ m/^(ENS\S+)/) {
+	my $d = $1;
+	if ($seq{$d}) {
+	  my $len = length ($seq{$d}{'seq'});
+	  print TAR ">", "chr_", $seq{$d}{'species'}, "_", $d, "_", $seq{$d}{'contig'}, "\n";
+	  print TAR $seq{$d}{'seq'}, "\n";
+	  print COR $a, "\t", "chr_", $seq{$d}{'species'}, "_", $d, "_", $seq{$d}{'contig'}, "\t", "1", "\t", $len, "\n";
+	  $a++;
+	}	
+      }
+    }
+    close IN1; 
+    close TAR;
+    close COR;
+    
+  }
+}
+
+sub exons {
+
+die(qq/
+6-MarkerSelectionEXONS exons [options] 
+
+options:
+-p    FILE      Reference protein
+-g    FILE      Reference genomic DNA
+-f    DIR       Deritory of all annotated transcripts (strict naming: ABC.fasta) 
+-e    INT       Minimal length cutoff for an exon to keep [200]
+-E    INT       Maximal length cutoff for an exon to keep [100000000000]
+-M    FLOAT     Maximun GC content cutoff for an exon to keep [0.7]
+-m    FLOAT     Minimal GC content cutoff for an exon to keep [0.4]
+
+
+What it will do:
+1. find unique exons in the reference (e.g. human)
+2. find the unique exons in each of the annotated trascripts when possible
+3. find homologous exons among transcriptomes, align them and then filter for redundancies
+4. calculate pairwise sequence divergence between orthologous exons (also variance, length, g\/c etc)
+5. export the following files: 1) all othologous exonic markers, 2) markers (one per gene) that pass the length and GC filter and ranked by average divergence.
+
+Note: if exons are already identified and a file "exons.unique" is ready and placed in the data folder, then step 1 will be skipped.
+
+\n\n/) unless (@ARGV);
+
+my %opts = (p=>undef, g=>undef, o=>undef, e=>200, f=>undef, M=>0.7, m=>0.4, E=>100000000000,n=>1);
+getopts('p:g:o:e:f:m:M:E:n:', \%opts);
+
+#-n    INT       How many random exons do you want to use as popgen markers [500]
+
+
+my $dir;
+if ($opts{f} =~ m/\/$/ ){
+$dir = $opts{f}; 
+}
+else {
+$dir = $opts{f} . "/";
+}
+
+my @annotation = <$dir*fasta>;
+my $Exons = $dir. 'exons';
+my $uniqueExons = $Exons . ".unique";
+my $exonLength = $opts{e};
+my $Max_exonLength = $opts{E};
+my $dbP = $opts{p} if $opts{p};
+my $dbG = $opts{g} if $opts{g};
+my $minGC = $opts{m};
+my $maxGC = $opts{M};
+my $popGen = $opts{n};
+
+
+#choose the longest protein as reference for annotation
+open (REGION, "<", $dbP);
+my %prob;
+my $id;
+my $gene;
+my $cor;
+while (<REGION>) {
+  chomp (my $line = $_);
+  if ($line =~ m/^>/) {
+    chomp (my @l = split /\s+/, $line);
+    next if $l[5] =~ m/pseudogene/;
+    chomp (my @a = split /:/, $l[2]);
+    $id = $1 if $l[0] =~ /^>(ENS\S+)/;
+    $gene = $1 if  $l[3] =~ /gene:(ENS\S+)/;
+    $cor = $l[2];
+    $prob{$gene}{$id}{'cor'} = $cor;
+  }
+  else {
+    $prob{$gene}{$id}{'seq'} .= $line;
+    $prob{$gene}{$id}{'len'} += length($line);
+  }
+}
+close REGION;
+
+$dbP = $dir . 'longest_protein.fasta';
+
+open (OUT, ">", $dbP);
+
+foreach my $gene (sort {$a cmp $b} keys %prob) {
+  foreach my $transcript (sort {$prob{$gene}{$b}{'len'} <=> $prob{$gene}{$a}{'len'}} keys %{$prob{$gene}}) {   
+    print OUT ">$gene", "\t", $prob{$gene}{$transcript}{'cor'}, "\n",   $prob{$gene}{$transcript}{'seq'}, "\n"; 
+    last;    
+  }
+}
+close OUT;
+system ("rm $dbP") if ( -f $uniqueExons);
+
+unless (-f $uniqueExons) {
+  print "now looking for unique exons in the reference! Hey by the way did you choose the right reference?", "\n";
+  findUniqueExons($Exons,$dbP,$dbG,$Exons, $uniqueExons, $exonLength)
+}
+
+foreach (@annotation) {  
+  print "\n";
+  my $id = $1 if basename($_) =~ m /(\S+).fasta/;
+  #unless (-f $dir . $id. '_exon.fa.nr') {
+    print "now looking for unique exons in ", basename($_), "!\n";
+    alignment($_, $uniqueExons, $dir);
+    my $infile = $dir . $id. '_exon.fa';
+    my $self1 = $dir . $id. '_exon.fa1';
+    my $hash_self = readSeq ($infile, $self1);
+    my %hash_self = %{$hash_self};
+    my $self2 = $dir . $id. '_exon.fa2';
+    system ("cp $self1 $self2");
+    my $final_nr = $dir . $id. '_exon.fa.nr';
+    print "\n\n";
+    print "now doing self-blasting for identified exons in $id!","\n";
+    self($self1, $self2, \%hash_self, $final_nr);
+    
+#  }
+}
+print "\n\n";
+print "now looking for homologous exons across individuals!", "\n";
+print "\n";
+find_homologs($dir);
+print "\n\n";
+print "now calculating divergence among homologous exons across individuals!", "\n";
+print "\n";
+calculateDiv($dir, $exonLength);
+print "\n\n";
+print "now doing initial filtering on markers!", "\n";
+print "\n";
+filter($dir, $Max_exonLength, $exonLength,$minGC, $maxGC, $popGen);
+
+
+#################################################################################
+
+ sub self {
+    my ($query, $db, $final, $out) = @_;
+    my %final = %{$final};
+    my $blastout = $query . '_blast.out';
+    my $call1 = system("makeblastdb -in $db -dbtype nucl");
+    my $call2 = system("blastn -db $db -query $query -evalue 1e-30 -outfmt 6 -out $blastout");
+    system("rm $db.n*");
+    open(IN, "<$query");
+    my %seq;
+    while (<IN>) {
+      chomp(my @line = split /\s+/, $_);
+      if ($line[0] =~ m/>(\S+)/) {
+	my $id = $1;
+	chomp(my $seq = <IN>);
+	$seq{$id} = {'seq'=>$seq, 'len'=> length ($seq)};
+      }
+    }
+    close(IN);
+    
+    my %tmp;
+    open(IN, "<$blastout");
+    while (<IN>) {
+      chomp(my $line = $_);
+      my @d = split(/\s+/,$line);
+      push(@{$tmp{$d[0]}},\@d);
+    }
+    close(IN);
+    system ("rm $blastout");
+    
+ my %final1;
+    foreach my $id (sort {$a cmp $b} keys %tmp) {
+      my %match;
+      if (scalar(@{$tmp{$id}}) > 1) {
+      for (my $i = 0; $i < scalar(@{$tmp{$id}}); $i++) {   
+	  $match{$tmp{$id}[$i][1]} = $seq{$tmp{$id}[$i][1]}{'len'};      	  
+      }
+       
+      foreach my $ids (sort { $match{$b} <=> $match{$a} } keys %match) {
+	    $final1{$ids}{'seq'} = $final{$ids}{'seq'};   
+	    last; 
+       }
+    }
+	      
+    if (scalar(@{$tmp{$id}} == 1) ) {
+       $final1{$id}{'seq'} = $final{$id}{'seq'};
+       
+    }  
+
+   }
+
+   my $ref = $query. "_tmp_file.txt";
+    open (OUT, ">", $ref);
+    foreach my $anno (sort {$a cmp $b} keys %final1) {
+	  print OUT  ">", $final{$anno}{'species'}, "\t", $final{$anno}{'contig'}, "\t", $anno,"\n", $final1{$anno}{'seq'}, "\n";     
+	}   
+       close OUT;
+    
+
+    my $ref1 = $ref . ".1"; 
+    system("cd-hit-est -i $ref -o $ref1 -M 0 -l 36 -d 100 -B 1 -r 1 -n 8");
+    system ("mv $ref1 $out");
+    system ("rm $ref1.* $ref");
+
+    unlink ($query);
+    unlink ($db);
+  }
+  
+
+sub readSeq {
+  my ($seqfile, $out) = @_;
+  my %seq;
+  open(IN, "<$seqfile");
+  
+  open (OUT, ">", $out);
+  while (<IN>) {
+    chomp(my @line = split /\s+/, $_);
+    if ($line[0] =~ m/^>(\S+)/) {
+      my $species = $1;
+      my $contig = $line[1];
+      my $prot = $line[2];
+      
+      chomp(my $seq = <IN>);
+      $seq{$prot} = {'seq'=>$seq, 'contig' => $contig, 'species' => $species};
+      print OUT ">", $prot, "\n", $seq,"\n";
+    }
+  }
+  close IN;
+  close OUT;
+  return(\%seq); 
+}
+
+
+
+sub filter {
+  my ($dir, $Max_exonLength, $exonLength,$minGC,$maxGC,$popGen ) = @_;
+  my $in = $dir . "marker_summary.txt";
+  open (IN, "<", $in);
+  my $out1 = $dir . "marker_kept.txt";
+  open (OUT1, ">", $out1);
+  my $out2 = $dir . "marker_abandoned.txt";
+  open (OUT2, ">", $out2);
+  
+  chomp (my $first = <IN>); 
+  print OUT1 $first, "\n";
+  print OUT2 $first, "\n";
+  
+  while (<IN>) {
+    chomp (my @line = split /\t/, $_);
+    if ($line[3] <= $Max_exonLength && $line[3] >= $exonLength && $line[4] >= $minGC && $line[4] <= $maxGC) {
+      print OUT1 join ("\t", @line), "\n";
+    }
+    else {
+      print OUT2 join ("\t", @line), "\n";
+      
+    }
+  }	
+  
+  close IN;
+  close OUT1;
+  close OUT2;
+  
+  my %hash;
+  open (IN, "<", $out1);
+  my $out3 = $dir . "marker_kept_one_exon_per_gene.txt";
+  open (OUT, ">", $out3);
+  while (<IN>) {
+    my @line = split /\s+/, $_;
+    if ($line[0] =~ m /(ENS\S+)_exon(\d+)/) {
+      my $contig = $1;
+      my $exon = $2;
+      $hash{$contig}{$exon} = join ("\t",@line[1..$#line]);
+    }
+  }
+  close IN;
+  
+  print OUT $first, "\n"; 
+  
+  foreach (sort {$a cmp $b} keys %hash) { 
+    my @array = ();
+    foreach my $pos (keys %{$hash{$_}}){
+      push (@array, $pos);
+    }
+    my $randomelement = $array[rand @array];
+    print OUT $_,"_exon", $randomelement, "\t", join("\t",$hash{$_}{$randomelement}), "\n";
+  }
+  close OUT;
+  
+  my @array2;
+  
+  my $out4 = $dir . "random_popgen_markers.txt1";
+  open (IN, "<", $out3);
+  open (OUT, ">", $out4);
+  
+  while (<IN>) { 
+    chomp (my $line = $_);
+    if ($line =~ m /ENS\S+_exon\d+/) {
+      push @array2, $line;
+    }
+  }
+  close IN;
+  print OUT $first, "\n";
+  my @s = shuffle(0..$#array2);
+  my @p = @s[ 0 .. $popGen - 1];
+  foreach (@p) {
+    print OUT $array2[$_], "\n";
+  }
+  close OUT;
+  
+  my $marker_final = $dir . "random_popgen_markers.txt";
+  system ("sort -k 2n,2 -k 4n,4 $out4 > $marker_final "); 
+  system ("rm $out4");
+  
+  my $marker1 = $dir . "marker_kept_one_exon_per_gene.txt1";
+  system ("sort -k 2n,2 -k 4n,4 $out3 > $marker1 "); 
+  system ("mv $marker1 $out3");
+  
+}
+
+
+sub calculateDiv {
+  my ($dir, $exonLength) = @_;
+  my $out = $dir . "marker_summary.txt";
+  my @aln = <$dir*.aln>;
+  my @seq = <$dir*.fasta>;
+  
+  open(OUT, ">", $out);
+  
+  print OUT "exon_name", "\t", "avgDiv", "\t"," varianceDiv", "\t", "avgLength", "\t", "avgGC", "\t";
+  
+  for (my $i = 0; $i < scalar @seq; $i++) {
+    for (my $j = $i+1; $j < scalar @seq; $j++) {	
+      my $sp1 = $1 if  basename($seq[$i]) =~ m/(\S+).fasta/;
+      my $sp2 = $1 if  basename($seq[$j]) =~ m/(\S+).fasta/;
+      
+      print OUT "div_",$sp1, "_vs_", $sp2, "\t";
+    }
+  }
+  print OUT "\n";
+  
+  foreach my $aln (@aln) {
+    
+    open(IN, "<$aln");
+    my $gene = $1 if basename($aln) =~ m/(\S+).aln/;
+    
+    my %ind;  
+    my $id; 
+    my $species; 
+    my $contig; 
+    my $exon;
+    
+    while (<IN>) {
+      chomp (my $line = $_); 
+      if ($line =~ m/^>(\S+)\s+/) {
+	$species = $1;
+	my @d =split /\s+/, $line;
+	$contig = $d[1];
+	$exon = $d[2]; 
+	$ind{$species} = {'contig' => $contig, 'exon' => $exon};		    
+      }
+      else {
+	$ind{$species}{'seq'} .= $line; 
+      }
+    }
+    close IN; 
+    system ("rm $aln");
+    
+    
+    my %sequence;		
+    foreach my $inds (sort {$a cmp $b} keys %ind) {
+      push (@{$sequence{'h'}},  {'species' =>$inds,  'contig' => $ind{$inds}{'contig'}, 'exon' => $ind{$inds}{'exon'}, 'seq' => $ind{$inds}{'seq'}});
+    }
+    print OUT $gene, "\t";
+    
+    my @div;	
+    my $zero = 0;
+    for (my $i = 0; $i < scalar (@{$sequence{'h'}}); $i++) {
+      for (my $j = $i+1; $j < scalar (@{$sequence{'h'}}); $j++) {	
+	my $div = div($sequence{'h'}[$i]{'seq'}, $sequence{'h'}[$j]{'seq'});
+	$div = sprintf("%.4f",$div) unless ($div eq 'NA');
+	unless ($div eq 'NA') {
+	  $zero++ if $div == 0;
+	}
+	push(@div,$div);
+      }
+    }		
+    
+    
+    my @length; my @gc; my $length = 0;
+    foreach my $c (sort {$a cmp $b} keys %ind) {
+      my $seq = $ind{$c}{'seq'};
+      my $l = ($seq =~ s/[atgc]//ig);
+      $seq = $ind{$c}{'seq'};
+      my $gc = ($seq =~ s/[gc]//ig);
+      $length++ if $l < $exonLength;
+      push(@length,$l);
+      push(@gc,$gc);
+    }
+    
+    
+    
+    my $avgDiv = sprintf("%.4f",average(\@div));
+    print OUT $avgDiv, "\t";
+    my $var = sprintf("%.4f",variance($avgDiv,\@div));
+    print OUT $var, "\t";	  
+    my $avgLength = sprintf("%d",average(\@length));
+    print OUT $avgLength, "\t";	  
+    my $avgGC = sprintf("%.4f",average(\@gc)/$avgLength);
+    print OUT $avgGC, "\t";
+    print OUT join ("\t", @div);
+    print OUT "\n";
+    
+  }
+  close(OUT);
+  
+}
+
+
+sub variance {
+  my ($avg, $a) = @_;
+  my @a = @{$a};
+  my $var;
+  if (scalar(@a) > 0) {
+    my $sum = 0; my $num;
+    foreach my $var (@a) {
+      unless ($var eq 'NA') {
+	$sum += ($avg - $var) ** 2;
+	$num++;
+      }
+    }	
+    $var = $sum/$num;
+  }
+  else {
+    $var = 0;
+  }
+  return($var);
+}		
+
+sub average {
+  my ($a) = @_;
+  my @a = @{$a};
+  my $avg;
+  if (scalar(@a) > 0) {
+    my $sum = 0; my $num;
+    foreach my $var (@a) {
+      unless ($var eq 'NA') {
+	$sum += $var;
+	$num++;
+      }
+    }	
+    $avg = $sum/$num;
+  }
+  else {
+    $avg = 0;
+  }
+  return($avg);
+}
+
+sub div {	
+  my ($seq1,$seq2) = @_;
+  my @b1 = split(//,$seq1);
+  my @b2 = split(//,$seq2);
+  
+  my %ti = ('A' => 'G', 'G' => 'A', 'C' => 'T', 'T' => 'C');
+  
+  my $gc; 
+  #my $ti = 0; 
+  my $tv = 0; 
+  my $l =0;;
+  
+   for (my $j = 0; $j < scalar(@b1); $j++) {
+    if (uc($b1[$j]) =~ m/[A|T|G|C|]/i) {
+      if (uc($b2[$j]) =~ m/[A|T|G|C]/) {	
+	$l++;
+	if (uc($b1[$j]) ne uc($b2[$j])) {	
+	  $tv++;
+	}
+      }	
+    }
+  }
+
+  #for (my $j = 0; $j < scalar(@b1); $j++) {
+  #  if (uc($b1[$j]) =~ m/[A|T|G|C]/i) {
+  #    if (uc($b1[$j]) =~ m/[G|C]/i) {
+  #	$gc++;
+  #    }	
+   #   if (uc($b2[$j]) =~ m/[A|T|G|C]/) {	
+#	$l++;
+#	if (uc($b1[$j]) ne uc($b2[$j])) {
+#	  if ( $ti{uc($b1[$j])} eq uc($b2[$j]) ) {
+#	    $ti++;
+#	  }
+#	  else {	
+#	    $tv++;
+#	  }
+#	}	
+  #   }	
+  #  }
+ # }
+  
+  my $div;
+  $div = $tv/$l if $l > 0;
+  $div = "NA" if $l == 0;
+  	
+  #if ($l > 0) {	
+   # my $p = $ti/$l; my $q = $tv/$l; my $w = $gc/$l;
+    
+  #  if ($w == 1) {
+  #    $div = 'NA';
+  #  }
+  #  else {	
+  #    my $a = 1 - ( $p/ (2 * $w * (1 - $w) ) ) - $q;
+  #    my $b = 1 - 2 * $q ;
+  #    if ($a <= 0 || $b <= 0 ) {
+  #	$div = 'NA';
+  #    }
+  #    else {	
+#	$div = (-2*$w) * ( 1 - $w) *  log( $a ) - 0.5 * ( 1 - 2 * $w * ( 1 - $w ) ) * log($b);
+ #     }
+  #  }	
+  #}
+  #else {
+  #  $div = 'NA';
+  #}
+
+
+  return($div);
+}
+
+sub find_homologs {
+  my ($dir) = @_;
+  my @seq = <$dir*_exon.fa.nr>;
+  my $total = scalar (@seq);
+  my $combined = $dir . 'combined_exon.fa'; 
+  system ("cat $dir*_exon.fa > $combined ");
+  
+  my %seq;
+  
+  my $out1 = $combined. "_1";
+  open (IN, "<", $combined);
+  open (OUT, ">", $out1);	
+  while (<IN>) {
+    chomp (my $line = $_); 
+    if ($line =~ m/>(\S+)/) {
+      my $species = $1;
+      my @d =split /\s+/, $line;
+      my $contig = $d[1];
+      my $exon = $d[2];
+      chomp (my $seq = <IN>);
+      print OUT $species, "\t", $contig, "\t", $exon, "\t", $seq, "\n";    
+    }
+  }
+  close IN; close OUT; 
+  system ("rm $combined ");
+  my $out2 = $combined. "_sorted";	
+  system ("sort -k 3,3 -k 1,1 $out1 > $out2");
+  system ("rm $out1");
+  
+  open (IN1, "<",  $out2);
+  while (<IN1>) {
+    chomp(my $line = $_);
+    my @d = split(/\t/,$line);
+    if ($seq{$d[2]}{'hulala'}) {		
+      push @{$seq{$d[2]}{'hulala'}}, {'contig' => $d[1], 'species' => $d[0], 'seq' => $d[3]};		
+    }
+    else { 
+      push @{$seq{$d[2]}{'hulala'}}, {'contig' => $d[1], 'species' => $d[0], 'seq' => $d[3]};	
+    }
+  }											
+  close IN1;
+  system ("rm $out2");
+  
+  
+  foreach my $id (keys %seq) {
+    if (scalar (@{$seq{$id}{'hulala'}}) == $total) {
+      my $in_muscle = $dir . $id . '.in';
+      open (OUT, ">", $in_muscle);
+      for (my $t = 0; $t < $total; $t++) {
+	print OUT ">", $seq{$id}{'hulala'}[$t]{'species'}, "\t", $seq{$id}{'hulala'}[$t]{'contig'}, "\t", $id, "\n", $seq{$id}{'hulala'}[$t]{'seq'},"\n";
+      }
+      close OUT;
+      my $out_muscle = $dir . $id . ".aln";
+      my $call1 = system("muscle -in $in_muscle -quiet -out $out_muscle");
+      my $call2 = system("rm $in_muscle") if (-f $out_muscle);
+    }
+  }
+}
+
+
+sub makeHash {
+  my ($protein, $genome) = @_;		
+  my %anno;
+  my %genome;
+  
+  open (PRO, "<", $protein);
+
+  my $gene;
+  while (<PRO>) {
+    chomp(my $line = $_);
+    if ($line =~ m/^>(ENS\S+)/) {
+      $gene = $1;
+      my @a = split(/\s/,$line);
+      my @d = split(/:/,$a[1]);
+      my $contig = $d[2];
+      my $start = $d[3];
+      my $end = $d[4];
+      $anno{$gene} = {'prot'=> $gene, 'contig'=> $contig, 'start'=>$start, 'end'=>$end};
+    }	  
+    else { 
+      $anno{$gene}{'seq'} .= $line;
+    }
+    
+  }	
+  close PRO;
+  
+  
+  open (GENOME, "<", $genome);
+  my $id;
+  my ($pos,$pos2);
+  
+  while (<GENOME>) {
+    chomp (my $line = $_);
+    if ($line =~ m/^>(\S+)/) {
+      $id = $1; 
+      $pos = tell (GENOME);
+    }
+    unless ($line =~ m/^>(\S+)/) {
+      push @{$genome{$id}}, $pos;
+      $pos2 = tell (GENOME);
+      $pos = $pos2;    
+    }    
+  }	
+  close GENOME;
+  return(\%anno,\%genome);
+  
+}
+
+sub findUniqueExons {
+  my ($anolisExons,$dbP,$dbG, $Exons, $uniqueExons, $exonLength) = @_;		
+  open(OUT, ">$anolisExons");			
+  my ($anno, $genome) = makeHash($dbP, $dbG);
+  my %anno = %$anno;
+  my %genome = %$genome;
+  
+  #$anno{$id} = {'prot'=>$id, 'contig'=>$contig, 'start'=>$start, 'end'=>$end, 'seq' =$seq};				
+  open (GE, "<", $dbG);
+  foreach my $ID (keys %anno) {			
+    my %final;
+    my $contigID = $anno{$ID}{'contig'};
+    my $seq = $anno{$ID}{'seq'};
+    my $e;
+    my $m;
+    if ($genome{$contigID}) {
+      for (my $i = 0 ; $i< scalar @{$genome{$contigID}}; $i++) {
+	seek GE, $genome{$contigID}[$i], 0;
+	chomp ($e = <GE>);
+	$m .= $e; 
+      }
+      my $DNA = substr ($m,$anno{$ID}{'start'}-1, $anno{$ID}{'end'}-$anno{$ID}{'start'}+1);   
+  
+      
+      my $target2 = "target2.fa";
+      my $query2 = "query2.fa";
+      
+      open (T2, ">$target2");
+      open (Q2, ">$query2");
+      
+      print T2 ">$ID\n$DNA\n";
+      print Q2 ">protein\n$seq\n";
+      
+      my @call = `exonerate --model protein2genome $query2 $target2 --showvulgar no --showalignment no --showtargetgff yes`;
+      my $cleanup = system("rm $query2 $target2");
+      my %cds;
+      foreach(@call){
+	if ($_ =~ m/orientation/) {
+	  $cds{'orient'} = $1 if $_ =~ m/([\+|\-])\s+\./;
+	}
+	elsif ($_ =~ m/exon\s+/) {
+	  my $bounds = $1 if $_ =~ m/exon\t([0-9]+\t[0-9]+)/;;
+	  my @bounds = split("\t", $bounds);
+	  $cds{'exon'}{$bounds[0]}=$bounds[1];
+	}
+      }
+      
+      #need to allow for a failure to find cds 
+      if (keys %cds){
+	my $tracker = 1;
+	if ($cds{'orient'} eq '+') {
+	  foreach(sort {$a <=> $b} keys %{$cds{'exon'}}){
+	    my $start = $_;
+	    my $end = $cds{exon}{$start};
+	    my $length = $end - $start + 1;
+	    $start = $start - 1;
+	    my $sub = substr $DNA, $start, $length;
+	    my $loc = $anno{$ID}{'contig'};
+	    my $loc_s = $anno{$ID}{'start'} + $start;
+	    my $loc_e = $loc_s + $length - 1;
+	    $loc = $loc . '_' . $loc_s . '_' . $loc_e;
+	    
+	    my $id = ">" . $ID . "_exon" . $tracker;
+	    $final{$id}{'seq'} = $sub;
+			      $final{$id}{'loc'} = $loc;
+	    $tracker++;
+	  }
+	}
+	else {
+	  foreach(sort {$b <=> $a} keys %{$cds{'exon'}}){
+	    my $start = $_;
+	    my $end = $cds{exon}{$start};
+	    my $length = $end - $start + 1;
+	    $start = $start - 1;
+	    my $sub = substr $DNA, $start, $length;
+	    $sub = reverse($sub);
+	    $sub =~ tr/ATGCatgc/TACGtacg/;
+	    
+	    my $loc = $anno{$ID}{'contig'};
+	    my $loc_s =$anno{$ID}{'start'} + $start;
+	    my $loc_e = $loc_s + $length - 1;                       
+	    $loc = $loc. '_' .$loc_s . '_' . $loc_e;
+	    
+	    my $id = ">" . $ID . "_exon" . $tracker;
+	    $final{$id}{'seq'} = $sub;
+	    $final{$id}{'loc'} = $loc;
+	  }
+	}
+	foreach my $id (keys %final) {
+	  print OUT $id, "\t$final{$id}{'loc'}\n", $final{$id}{'seq'}, "\n";
+	}
+      }	
+      else {
+	print "couldn't define CDS for $ID\n";
+      }
+    }
+  }
+  close(OUT);
+  close (GE);
+  my $call1 = system("cd-hit-est -i $Exons -o $uniqueExons -c 1.00 -l $exonLength");
+  my $call2 = system("rm $uniqueExons" . ".*");
+  
+}
+
+
+sub alignment {
+  my ($seq,$uniqueExons, $dir) = @_;		
+  my %seq;
+  my $id = $1 if basename($seq) =~ m/(\S+).fasta/;
+  open(SEQ, "<", $seq);	
+  while(<SEQ>) {
+    chomp(my @line = split /\s+/, $_);
+    if (scalar @line >1) {
+      if ($line[0] =~ m/>(\S+)/) {
+	my $id = $1;
+	my $prot = $line[2];	  
+	chomp(my $seq = <SEQ>);
+	$seq{$prot} = {'contig' => $id, 'seq' => $seq};
+      }
+    }
+  }
+  close SEQ; 
+ 
+  my %exons;
+  open(IN, "<", $uniqueExons);
+  while(<IN>) {
+    chomp(my $line = $_);
+    if ($line =~ m/>(\S+)/) {
+      my $id = $1;
+      chomp(my $seq = <IN>);
+      $exons{$id} = $seq;
+    }
+  }
+  close IN; 
+  
+  my $out = $dir . $id.  "_exon.fa";
+  open(FINAL, ">", $out);	
+  foreach my $exon (sort {$a cmp $b} keys %exons) {
+    
+    my $s = $1 if ($exon =~ m/^(ENS\S+)_exon\d+/);
+    if ($seq{$s}) {
+      my $target = "target.fa";
+      my $query = "query.fa";
+      open (T, ">", $target);
+      open (Q, ">", $query);
+      
+      print T ">$seq{$s}{'contig'}\n$seq{$s}{'seq'}\n";
+      print Q ">$exon\n$exons{$exon}\n";
+      my $elength = length($exons{$exon});
+      my @call = `exonerate -m coding2coding $query $target --bestn 1  --showvulgar yes --showalignment no`;
+      my $cleanup = system("rm $query $target");
+      
+      if ($call[3]) {
+	if ($call[2] =~ m/vulgar/) {
+	  my @d = split(/\s+/,$call[2]);
+	  my $length = abs($d[6] - $d[7]);					
+	  my $sub; 
+	  my $start;
+	  
+	  if ($d[4] =~ m/\+/ && $d[8] =~ m/\+/) {
+	    $start = $d[6];
+	    $sub = substr $seq{$s}{'seq'}, $start, $length;
+	  }
+	  elsif ($d[4] =~ m/\+/ && $d[8] =~ m/\-/) {
+	    $start = $d[7];
+	    $sub = substr $seq{$s}{'seq'}, $start, $length;
+	    $sub = reverse($sub);
+	    $sub =~ tr/ATGCatgc/TACGtacg/;
+	  }
+	  elsif ($d[4] =~ m/\-/ && $d[8] =~ m/\-/) {
+	    $start = $d[7];
+	    $sub = substr $seq{$s}{'seq'}, $start, $length;
+	  }
+	  elsif ($d[4] =~ m/\-/ && $d[8] =~ m/\+/) {
+	    $start = $d[6];
+	    $sub = substr $seq{$s}{'seq'}, $start, $length;
+	    $sub = reverse($sub);
+	    $sub =~ tr/ATGCatgc/TACGtacg/;
+	  }
+	  
+	  if ($length/$elength >= 0.9) {
+	    my $end = $start + $length - 1;
+	    my $loc = $seq{$s}{'contig'} . '_' . $start . "_" . $end;
+	    print FINAL ">$id", "\t", "$loc", "\t", $exon, "\n", $sub, "\n";
+	  }
+	}				
+      }	
+    }
+    
+  }
+  close FINAL;
+}
+}
+
+
